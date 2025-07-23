@@ -1,0 +1,199 @@
+# ABIDE fMRI Classification using SVM, KNN, ANN, and Stacking
+
+# -----------------------------
+# STEP 1: Imports and Setup
+# -----------------------------
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from nilearn.datasets import fetch_abide_pcp
+from nilearn.connectome import ConnectivityMeasure, sym_to_vec
+from sklearn import preprocessing
+from sklearn.model_selection import train_test_split, cross_validate
+from sklearn.metrics import accuracy_score
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import StackingClassifier
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Input
+import warnings
+warnings.filterwarnings('ignore')
+
+# Plot style
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman'] + plt.rcParams['font.serif']
+
+# -----------------------------
+# STEP 2: Data Loading & Preprocessing
+# -----------------------------
+data = fetch_abide_pcp(derivatives=['rois_aal'], SITE_ID=['NYU'])
+conn_est = ConnectivityMeasure(kind='correlation')
+conn_matrices = conn_est.fit_transform(data['rois_aal'])
+
+# Convert symmetric matrices to vectors
+X = sym_to_vec(conn_matrices)
+
+# Labels
+y = data.phenotypic['DX_GROUP']
+y[y == 2] = -1  # Convert to binary classification: 1 (control), -1 (autism)
+
+# Feature scaling
+scaler = preprocessing.StandardScaler().fit(X)
+X = scaler.transform(X)
+
+# -----------------------------
+# STEP 3: Train/Test Split
+# -----------------------------
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# -----------------------------
+# STEP 4: Support Vector Machine
+# -----------------------------
+def run_svm(X, y, kernel):
+    C_range = [2 ** i for i in range(-5, 16)]
+    gamma_range = [2 ** i for i in range(-15, 4)]
+    acc = dict()
+    for c in C_range:
+        cur_acc = dict()
+        for g in gamma_range:
+            clf = SVC(C=c, kernel=kernel, gamma=g, tol=1e-10, class_weight='balanced')
+            cv_results = cross_validate(clf, X, y, cv=5)
+            score = np.mean(cv_results['test_score'])
+            cur_acc[g] = score
+        acc[c] = cur_acc
+    return pd.DataFrame(acc)
+
+def plot_3d_accuracy(df, title):
+    from mpl_toolkits.mplot3d import Axes3D
+    from matplotlib import cm
+    X, Y, Z = [], [], []
+    for i in range(-5, 16):
+        for j in range(-15, 4):
+            x = 2 ** i
+            y = 2 ** j
+            z = df[x][y]
+            X.append(i)
+            Y.append(j)
+            Z.append(z)
+    fig = plt.figure(dpi=300)
+    ax = fig.add_subplot(111, projection='3d')
+    ax.plot_trisurf(X, Y, Z, cmap=cm.jet)
+    ax.set_xlabel('log2(C)')
+    ax.set_ylabel('log2(Gamma)')
+    ax.set_zlabel('Accuracy')
+    ax.set_title(title)
+    plt.show()
+
+# Example: RBF kernel
+svm_rbf_results = run_svm(X, y, 'rbf')
+plot_3d_accuracy(svm_rbf_results, 'SVM RBF Kernel Accuracy')
+
+# -----------------------------
+# STEP 5: K-Nearest Neighbors
+# -----------------------------
+def run_knn(X, y):
+    acc_manhattan, acc_euclidean = [], []
+    for k in range(1, 51):
+        clf_m = KNeighborsClassifier(n_neighbors=k, p=1)
+        acc_m = np.mean(cross_validate(clf_m, X, y, cv=5)['test_score'])
+        acc_manhattan.append(acc_m)
+
+        clf_e = KNeighborsClassifier(n_neighbors=k, p=2)
+        acc_e = np.mean(cross_validate(clf_e, X, y, cv=5)['test_score'])
+        acc_euclidean.append(acc_e)
+
+    plt.figure(dpi=300)
+    plt.plot(range(1, 51), acc_manhattan, label='Manhattan')
+    plt.plot(range(1, 51), acc_euclidean, label='Euclidean')
+    plt.xlabel('K Value')
+    plt.ylabel('Accuracy')
+    plt.title('KNN Accuracy')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+run_knn(X, y)
+
+# -----------------------------
+# STEP 6: Neural Network (Sklearn MLP)
+# -----------------------------
+architecture = {
+    '0 layer': (),
+    '1 layer - 6 nodes': (6,),
+    '2 layers - 8,4 nodes': (8, 4),
+    '3 layers - 4 each': (4, 4, 4)
+}
+lr_rates = [1e-5, 1e-4, 1e-3, 1e-2]
+acc = dict()
+for name, arch in architecture.items():
+    arch_acc = dict()
+    for lr in lr_rates:
+        clf = MLPClassifier(hidden_layer_sizes=arch, learning_rate_init=lr, max_iter=3000)
+        score = np.mean(cross_validate(clf, X, y, cv=5)['test_score'])
+        arch_acc[lr] = score
+    acc[name] = arch_acc
+
+result_df = pd.DataFrame(acc)
+plt.figure(dpi=300)
+for name in result_df.columns:
+    plt.plot(result_df.index, result_df[name], label=name)
+plt.xscale('log')
+plt.xlabel('Learning Rate')
+plt.ylabel('Accuracy')
+plt.title('ANN Accuracy with Varying Architectures')
+plt.legend()
+plt.grid()
+plt.show()
+
+# -----------------------------
+# STEP 7: Deep Neural Network (TensorFlow)
+# -----------------------------
+input_shape = X_train.shape[1]
+model = Sequential([
+    Input(shape=(input_shape,)),
+    Dense(32, activation='relu'),
+    Dense(32, activation='relu'),
+    Dense(32, activation='relu'),
+    Dense(2, activation='softmax')
+])
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+model.fit(X_train, y_train, epochs=100, batch_size=64)
+
+y_pred = np.argmax(model.predict(X_test), axis=1)
+print("DNN Accuracy:", accuracy_score(y_test, y_pred))
+
+# -----------------------------
+# STEP 8: Stacked Ensemble
+# -----------------------------
+def get_stacked_model():
+    base_models = [
+        ('lr', LogisticRegression()),
+        ('knn', KNeighborsClassifier(n_neighbors=29, p=1)),
+        ('svm', SVC(C=4, gamma=0.000122))
+    ]
+    meta_model = LogisticRegression()
+    return StackingClassifier(estimators=base_models, final_estimator=meta_model, cv=5)
+
+models = {
+    'Logistic Regression': LogisticRegression(),
+    'KNN': KNeighborsClassifier(n_neighbors=29, p=1),
+    'SVM': SVC(C=4, gamma=0.000122),
+    'Stacked': get_stacked_model()
+}
+
+results = []
+labels = []
+for name, clf in models.items():
+    scores = cross_validate(clf, X, y, cv=5)['test_score']
+    results.append(scores)
+    labels.append(name)
+    print(f"> {name}: {np.mean(scores):.3f} (±{np.std(scores):.3f})")
+
+plt.figure(dpi=300)
+plt.boxplot(results, labels=labels, showmeans=True)
+plt.title("Model Comparison - Stacking vs Base Models")
+plt.show()
